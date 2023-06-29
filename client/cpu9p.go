@@ -24,6 +24,7 @@ import (
 	"syscall"
 
 	"github.com/hugelgupf/p9/p9"
+	"golang.org/x/sys/unix"
 )
 
 // cpu9p is a p9.Attacher.
@@ -32,6 +33,35 @@ type cpu9p struct {
 
 	path string
 	file *os.File
+
+	// pendingXattr is the xattr-related operations that are going to be done
+	// in a tread or twrite request.
+	pendingXattr pendingXattr
+}
+
+// xattrOp is the xattr related operations, walk or create.
+type xattrOp int
+
+const (
+	xattrNone   = 0
+	xattrCreate = 1
+	xattrWalk   = 2
+)
+
+type pendingXattr struct {
+	// the pending xattr-related operation
+	op xattrOp
+
+	// name is the attribute.
+	name string
+
+	// size of the attribute value, represents the
+	// length of the attribute value that is going to write to or read from a file.
+	size uint64
+
+	// flags associated with a txattrcreate message.
+	// generally Linux setxattr(2) flags.
+	flags uint32
 }
 
 // Attach implements p9.Attacher.Attach.
@@ -69,6 +99,34 @@ func (l *cpu9p) info() (p9.QID, os.FileInfo, error) {
 	// Save the path from the Ino.
 	qid.Path = fi.Sys().(*syscall.Stat_t).Ino
 	return qid, fi, nil
+}
+
+func (l *cpu9p) XattrWalk(attr string) (p9.File, uint64, error) {
+	emptyBuf := make([]byte, 0)
+	var size int
+	var err error
+	if attr == "" {
+		size, err = unix.Llistxattr(l.path, emptyBuf)
+	} else {
+		size, err = unix.Lgetxattr(l.path, attr, emptyBuf)
+	}
+	newFile := &cpu9p{
+		path: l.path,
+		pendingXattr: pendingXattr{
+			op:   xattrWalk,
+			name: attr,
+			size: uint64(size),
+		},
+	}
+	return newFile, uint64(size), err
+}
+
+func (l *cpu9p) XattrCreate(attr string, size uint64, flags uint32) error {
+	l.pendingXattr.op = xattrCreate
+	l.pendingXattr.name = attr
+	l.pendingXattr.size = size
+	l.pendingXattr.flags = flags
+	return nil
 }
 
 // Walk implements p9.File.Walk.
@@ -142,7 +200,23 @@ func (l *cpu9p) Open(mode p9.OpenFlags) (p9.QID, uint32, error) {
 
 // Read implements p9.File.ReadAt.
 func (l *cpu9p) ReadAt(p []byte, offset int64) (int, error) {
-	return l.file.ReadAt(p, int64(offset))
+	switch l.pendingXattr.op {
+	case xattrNone:
+		return l.file.ReadAt(p, int64(offset))
+	case xattrWalk:
+		if len(p) == 0 {
+			return 0, nil
+		}
+		if offset != 0 {
+			return 0, syscall.EINVAL
+		}
+		if l.pendingXattr.name == "" {
+			return unix.Llistxattr(l.path, p)
+		}
+		return unix.Lgetxattr(l.path, l.pendingXattr.name, p)
+	default:
+		return 0, syscall.EINVAL
+	}
 }
 
 // Write implements p9.File.WriteAt.
@@ -154,13 +228,25 @@ func (l *cpu9p) ReadAt(p []byte, offset int64) (int, error) {
 // error, and call Write if it is the rare case of a second write
 // to an append-only file..
 func (l *cpu9p) WriteAt(p []byte, offset int64) (int, error) {
-	n, err := l.file.WriteAt(p, int64(offset))
-	if err != nil {
-		if strings.Contains(err.Error(), "os: invalid use of WriteAt on file opened with O_APPEND") {
-			return l.file.Write(p)
+	switch l.pendingXattr.op {
+	case xattrNone:
+		n, err := l.file.WriteAt(p, int64(offset))
+		if err != nil {
+			if strings.Contains(err.Error(), "os: invalid use of WriteAt on file opened with O_APPEND") {
+				return l.file.Write(p)
+			}
 		}
+		return n, err
+	case xattrCreate:
+		if offset != 0 {
+			return 0, syscall.EINVAL
+		}
+		flags := int(l.pendingXattr.flags)
+		return int(l.pendingXattr.size), unix.Lsetxattr(l.path, l.pendingXattr.name, p, flags)
+	default:
+		return 0, syscall.EINVAL
 	}
-	return n, err
+
 }
 
 // Create implements p9.File.Create.
